@@ -1,0 +1,376 @@
+---
+title: "Project: Predict Employee Turnover Rate"
+
+---
+
+#Importing libraries & Dataset 
+```{r}
+# Load necessary libraries
+library(dplyr)
+library(ggplot2)
+library(caret)
+library(DMwR2)
+library(randomForest)
+library(xgboost)
+library(e1071)
+library(nnet)
+library(glmnet)
+library(rpart)
+library(smotefamily)
+library(h2o)
+set.seed(1)
+df <- read.csv("HR_capstone_dataset.csv", stringsAsFactors = TRUE)
+```
+
+#Preprocessing
+```{r}
+# One-hot encode categorical variables
+df$salary <- as.numeric(factor(df$salary, levels = c("low", "medium", "high"), ordered = TRUE))
+# One-hot encode the 'Department' column
+df <- df %>%
+  mutate(Department = as.factor(Department)) %>%
+  cbind(model.matrix(~ Department - 1, data = df)) %>%  # This creates the one-hot encoded columns
+  select(-Department)  # Remove the original 'Department' column
+
+# Convert target variable to factor
+df_encoded <- model.matrix(left ~ . -1, data = df) %>% as.data.frame()
+df_encoded$left <- as.factor(df$left)
+
+# Split data into training and testing sets
+set.seed(1)
+trainIndex <- createDataPartition(df_encoded$left, p = 0.8, list = FALSE)
+train <- df_encoded[trainIndex, ]
+test <- df_encoded[-trainIndex, ]
+
+
+#SMOTE
+X <- train[, !names(train) %in% "left"]
+y <- train$left
+smote_result <- SMOTE(X = X, target = y, K = 5, dup_size = 2)
+df_smote <- data.frame(smote_result$data)
+colnames(df_smote)[ncol(df_smote)] <- "left"
+df_smote$left <- as.factor(df_smote$left)
+train_smote <- df_smote
+```
+
+#EDA
+```{r}
+library(patchwork)
+# Plot BEFORE SMOTE
+p1 <- ggplot(train, aes(x = left)) +
+  geom_bar(fill = "steelblue") +
+  ggtitle("Class Distribution BEFORE SMOTE") +
+  xlab("Left") +
+  ylab("Count") +
+  theme_minimal()
+
+p2 <- ggplot(train_smote, aes(x = left)) +
+  geom_bar(fill = "darkorange") +
+  ggtitle("Class Distribution AFTER SMOTE") +
+  xlab("Left") +
+  ylab("Count") +
+  theme_minimal()
+
+# Combine side by side
+p1 + p2
+```
+
+
+```{r}
+# Turnover rate by salary level
+ggplot(df_encoded, aes(x = salary, fill = left)) +
+  geom_bar(position = "fill") +
+  ylab("Proportion") +
+  ggtitle("Employee Turnover Rate by Salary Level") +
+  theme_minimal()
+
+#turnover rate by number of project
+ggplot(df_encoded, aes(x = number_project, fill = left)) +
+  geom_bar(position = "fill") +
+  ylab("Proportion") +
+  ggtitle("Employee Turnover Rate by Number of Project") +
+  theme_minimal()
+
+#turnover rate by Promotion in the last 5 years
+ggplot(df_encoded, aes(x = promotion_last_5years, fill = left)) +
+  geom_bar(position = "fill") +
+  ylab("Proportion") +
+  ggtitle("Employee Turnover Rate by Promotion in the last 5 years") +
+  theme_minimal()
+```
+
+```{r}
+num_cols <- c("satisfaction_level", "last_evaluation", "number_project",
+              "average_montly_hours", "time_spend_company",
+              "Work_accident", "promotion_last_5years")
+
+#Distribution of numerical variables
+for (col in num_cols) {
+  p <- ggplot(df, aes_string(x = col)) +
+    geom_histogram(aes(y = ..density..), fill = "skyblue", bins = 30, color = "black") +
+    geom_density(color = "red", size = 1) +
+    ggtitle(paste("Distribution of", col)) +
+    theme_minimal()
+  print(p)
+}
+```
+#Histogram
+```{r}
+library(tidyverse)
+df_long <- df %>%
+  select(all_of(num_cols)) %>%
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "value")
+
+# Faceted histogram
+ggplot(df_long, aes(x = value)) +
+  geom_histogram(bins = 30, fill = "skyblue", color = "black") +
+  facet_wrap(~variable, scales = "free") +
+  theme_minimal()
+```
+
+
+#Corrplot
+```{r}
+library(corrplot)
+# Select only numeric columns including left
+df_numeric <- df %>%
+  select(all_of(c(num_cols, "left"))) %>%
+  mutate(left = as.numeric(as.character(left)))
+
+# Compute correlation matrix
+cor_matrix <- cor(df_numeric)
+
+# Plot the heatmap
+corrplot(cor_matrix, method = "color", type = "upper", tl.col = "black", addCoef.col = "black")
+```
+
+
+#Pruned Tree using SMOTE + CV + Hyperparameter tuning
+```{r}
+library(rpart)
+library(rpart.plot)
+library(caret)
+# ===============
+# Pruned Tree
+# ===============
+dtree_model <- rpart(left ~ ., data = train_smote, method = "class")
+
+printcp(dtree_model)  # Complexity parameter table
+plotcp(dtree_model)   # Plot CP values
+
+# Get the optimal CP value 
+optimal_cp <- dtree_model$cptable[which.min(dtree_model$cptable[, "xerror"]), "CP"]
+
+# Prune the tree
+pruned_tree <- prune(dtree_model, cp = optimal_cp)
+pruned_pred <- predict(pruned_tree, test, type = "class")
+
+rpart.plot(pruned_tree)
+# Confusion Matrix
+pruned_conf_matrix <- confusionMatrix(pruned_pred, test$left)
+cat("Accuracy Pruned Tree:", pruned_conf_matrix$overall['Accuracy'], "\n")
+cat("Precision Pruned Tree:", pruned_conf_matrix$byClass['Precision'], "\n")
+cat("Recall Pruned Tree:", pruned_conf_matrix$byClass['Recall'], "\n")
+cat("F1 Score Pruned Tree:", pruned_conf_matrix$byClass['F1'], "\n")
+
+# ===========================
+# Hyperparameter-Tuned Decision Tree Model (cp, minsplit, maxdepth)
+# ===========================
+grid <- expand.grid(cp = seq(0.001, 0.05, by = 0.005),
+                    minsplit = c(5, 10, 15, 20),
+                    maxdepth = c(3, 5, 7, 10))
+
+best_model <- NULL
+best_accuracy <- 0
+best_params <- NULL
+
+# Grid Search
+for (i in 1:nrow(grid)) {
+  params <- grid[i, ]
+  
+  tree_model <- rpart(left ~ ., data = train_smote, method = "class",
+                      control = rpart.control(cp = params$cp, 
+                                              minsplit = params$minsplit,
+                                              maxdepth = params$maxdepth),
+                      )
+  
+  predictions <- predict(tree_model, test, type = "class")
+  accuracy <- sum(predictions == test$left) / nrow(test)
+  
+  if (accuracy > best_accuracy) {
+    best_accuracy <- accuracy
+    best_model <- tree_model
+    best_params <- params
+  }
+}
+
+# Print best parameters
+print(best_params)
+
+# Train model with best hyperparameters
+best_tree <- rpart(left ~ ., data = train_smote, method = "class",
+                   control = rpart.control(cp = best_params$cp, 
+                                           minsplit = best_params$minsplit,
+                                           maxdepth = best_params$maxdepth))
+
+# Predict on test data
+best_tree_pred <- predict(best_tree, test, type = "class")
+
+# Compute confusion matrix
+best_tree_conf_matrix <- confusionMatrix(best_tree_pred, test$left)
+cat("Accuracy Best Tree:", best_tree_conf_matrix$overall['Accuracy'], "\n")
+cat("Precision  Best Tree:", best_tree_conf_matrix$byClass['Precision'], "\n")
+cat("Recall  Best Tree:",best_tree_conf_matrix$byClass['Recall'], "\n")
+cat("F1 Score  Best Tree:", best_tree_conf_matrix$byClass['F1'], "\n")
+
+```
+
+#Bagging
+```{r}
+library(randomForest)
+library(caret)
+
+# Train Bagging Model 
+bagging_model <- randomForest(left ~ ., data = train_smote, 
+                              mtry = ncol(train_smote) - 1,  # Use all features at each split
+                              ntree = 50,                    # Number of decision trees
+                              importance = TRUE)             # Enable feature importance calculation
+# Predictions
+bagging_pred <- predict(bagging_model, test)
+
+# Feature Importance
+importance(bagging_model)
+varImpPlot(bagging_model)
+
+# Confusion Matrix
+bagging_conf_matrix <- confusionMatrix(bagging_pred, test$left)
+cat("Accuracy Bagging:", bagging_conf_matrix$overall['Accuracy'], "\n")
+cat("Precision Bagging:", bagging_conf_matrix$byClass['Precision'], "\n")
+cat("Recall Bagging:", bagging_conf_matrix$byClass['Recall'], "\n")
+cat("F1 Score Bagging:", bagging_conf_matrix$byClass['F1'], "\n")
+
+```
+
+
+#Random Forest
+```{r}
+# Train Random Forest Model
+rf_model <- randomForest(left ~ ., data = train_smote, 
+                         mtry = sqrt(ncol(train) - 1),  # Number of features randomly selected at each split
+                         ntree = 200,                   # Number of decision trees
+                         importance = TRUE)
+# Predictions
+rf_pred <- predict(rf_model, test)
+
+# Feature Importance
+importance(rf_model)
+varImpPlot(rf_model)
+
+rf_conf_matrix <- confusionMatrix(rf_pred, test$left)
+cat("Accuracy Basic RF:", rf_conf_matrix$overall['Accuracy'], "\n")
+cat("Precision Basic RF:", rf_conf_matrix$byClass['Precision'], "\n")
+cat("Recall Basic RF:", rf_conf_matrix$byClass['Recall'], "\n")
+cat("F1 Score Basic RF:", rf_conf_matrix$byClass['F1'], "\n")
+```
+
+#Baseline SVM
+```{r}
+#Basic SVM Model
+#Kernel = Linear 
+svm_model_L <- svm(left ~., data = train, type = "C-classification", kernel = "linear")
+svm_pred_L <- predict(svm_model_L, test)
+#Kernel = Radial 
+svm_model_R <- svm(left ~., data = train, type = "C-classification", kernel = "radial")
+svm_pred_R <- predict(svm_model_R, test)
+#Kernel = sigmoid 
+svm_model_S <- svm(left ~., data = train, type = "C-classification", kernel = "sigmoid")
+svm_pred_S <- predict(svm_model_S, test)
+#Kernel = polynomial 
+svm_model_P <- svm(left ~., data = train, type = "C-classification", kernel = "polynomial")
+svm_pred_P <- predict(svm_model_P, test)
+
+#Evaluate
+conf_matrix_R <- confusionMatrix(svm_pred_R, test$left)
+cat("Accuracy SVM_R:", conf_matrix_R$overall['Accuracy'], "\n")
+cat("Precision SVM_R:", conf_matrix_R$byClass['Precision'], "\n")
+cat("Recall SVM_R:", conf_matrix_R$byClass['Recall'], "\n")
+cat("F1 Score SVM_R:", conf_matrix_R$byClass['F1'], "\n")
+```
+
+
+#SVM Tuned
+```{r}
+#=========================================
+#TUNE 1: Hyper-parameter Tuning for Radial
+#=========================================
+#Define tuning grid for radial SVM (Cost C and Sigma/Gamma)
+tune_grid <- expand.grid(sigma = c(0.001, 0.01, 0.1, 1, 10),   # gamma/sigma values
+                         C = c(0.0001, 0.001, 0.1, 1, 10))     # Cost values
+# 5-fold cross-validation
+train_control <- trainControl(method = "cv", number = 5) 
+
+# Train SVM with RBF kernel and hyperparameter tuning
+svm_rbf_model <- train(left ~ .,data = train, 
+                       method = "svmRadial",
+                       trControl = train_control,
+                       tuneGrid = tune_grid)
+# Extract best hyperparameters
+print(svm_rbf_model$bestTune)
+best_cost <- svm_rbf_model$bestTune$C
+best_gamma <- svm_rbf_model$bestTune$sigma
+best_cost
+best_gamma
+
+# Train final SVM model with optimized hyperparameters
+svm_final <- svm(left ~ ., data = train, kernel = "radial", cost = best_cost, gamma = best_gamma)
+
+# Predict on test set
+svm_final_pred <- predict(svm_final, test)
+
+# Evaluate final model
+conf_matrix_final <- confusionMatrix(svm_final_pred, test$left)
+cat("Accuracy SVM1:", conf_matrix_final$overall['Accuracy'], "\n")
+cat("Precision SVM1:", conf_matrix_final$byClass['Precision'], "\n")
+cat("Recall SVM1:", conf_matrix_final$byClass['Recall'], "\n")
+cat("F1 Score SVM1:", conf_matrix_final$byClass['F1'], "\n")
+
+#=====================================================================
+#TUNE 2: Hyper-parameter tuning using class weight for imbalanced data
+#======================================================================
+tune_grid <- expand.grid(sigma = c(0.001, 0.01, 0.1, 1, 10),   # gamma/sigma values
+                         C = c(0.0001, 0.001, 0.1, 1, 10))     # Cost values
+# 5-fold cross-validation
+control <- trainControl(method = "cv", number = 5) 
+
+# Compute class weights inversely proportional to class frequencies
+table(train$left) # Check class distribution
+# Set weights inversely proportional to class size
+weights <- c("0" = 2857 / 9143, "1" = 9143 / 2857)
+
+# Train SVM with class weights
+svm_tuned_2 <- train(left ~ ., data = train, 
+               method = "svmRadial",
+               tuneGrid = tune_grid, trControl = control,
+               class.weights = weights)
+
+# Extract best hyperparameters
+print(svm_tuned_2$bestTune)
+best_cost2 <- svm_rbf_model$bestTune$C
+best_gamma2 <- svm_rbf_model$bestTune$sigma
+best_cost2
+best_gamma2
+
+# Train final SVM model with optimized hyperparameters
+svm_final2 <- svm(left ~ ., data = train, kernel = "radial", cost = best_cost2, gamma = best_gamma2,class.weights = weights)
+
+# Predict on test set
+svm_final_pred2 <- predict(svm_final2, test)
+
+# Evaluate final model
+conf_matrix_final2 <- confusionMatrix(svm_final_pred2, test$left)
+cat("Accuracy SVM2:", conf_matrix_final2$overall['Accuracy'], "\n")
+cat("Precision SVM2:", conf_matrix_final2$byClass['Precision'], "\n")
+cat("Recall SVM2:", conf_matrix_final2$byClass['Recall'], "\n")
+cat("F1 Score SVM2:", conf_matrix_final2$byClass['F1'], "\n")
+
+```
